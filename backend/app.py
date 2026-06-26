@@ -9,14 +9,21 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.pipeline import Pipeline
+import joblib
 
 app = Flask(__name__)
 CORS(app)
 
 # ── PATHS ─────────────────────────────────────────────────────────────────────
-BASE     = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE, "..", "..", "APP")
+BASE      = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR  = os.path.join(BASE, "..", "..", "APP")
+MODEL_DIR = os.path.join(BASE, "model")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+MODEL_PATH    = os.path.join(MODEL_DIR, "clf.joblib")
+WORD_VEC_PATH = os.path.join(MODEL_DIR, "word_vec.joblib")
+CHAR_VEC_PATH = os.path.join(MODEL_DIR, "char_vec.joblib")
+META_PATH     = os.path.join(MODEL_DIR, "meta.joblib")   # accuracy, report, cm
 
 LABELS    = {"POSITIVE", "NEUTRAL", "NEGATIVE"}
 LABEL_MAP = {"NEGATIVE": 0, "NEUTRAL": 1, "POSITIVE": 2}
@@ -30,19 +37,18 @@ STOPWORDS = set([
     "he","she","their","there","will","been","one","about","your","even","after",
     "also","too","use","using","would","could","should","which","am","let","please",
     "dont","nt","our","his","her","us","than","only","now","some","like",
-    "much","well","into","over","such","while","them","these","those","then","here","where",
+    "much","into","over","such","while","them","these","those","then","here","where",
 ])
 
 # ── GLOBAL STATE ──────────────────────────────────────────────────────────────
 _status         = {"ready": False, "step": "Starting up..."}
-_word_vec       = None   # word-level TF-IDF
-_char_vec       = None   # char-level TF-IDF
-_model          = None   # CalibratedClassifierCV(LinearSVC)
+_word_vec       = None
+_char_vec       = None
+_model          = None
 _model_acc      = 0.0
 _report         = {}
 _cm             = []
 _before_balance = {}
-_after_balance  = {}
 _train_df       = None
 _test_df        = None
 _overview       = {}
@@ -54,18 +60,15 @@ _len_dist       = {}
 
 # ── TEXT HELPERS ──────────────────────────────────────────────────────────────
 def normalize_repeated(text):
-    """loooove → loove  (max 2 consecutive identical chars)"""
     return re.sub(r'(.)\1{2,}', r'\1\1', text)
 
 def clean_text(text):
-    if not isinstance(text, str):
-        return ""
-    text = re.sub(r"[^\x00-\x7F]+", " ", text)    # strip emoji/unicode
-    text = re.sub(r"http\S+|www\S+", " ", text)    # strip URLs
-    text = normalize_repeated(text)                 # loooove → loove
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)       # letters only
-    text = re.sub(r"\s+", " ", text)
-    return text.lower().strip()
+    if not isinstance(text, str): return ""
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = normalize_repeated(text)
+    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    return re.sub(r"\s+", " ", text).lower().strip()
 
 def has_emoji(text):
     return bool(re.search(r"[^\x00-\x7F]", text)) if isinstance(text, str) else False
@@ -88,60 +91,45 @@ def length_bucket(l):
 
 # ── FEATURE BUILDER ───────────────────────────────────────────────────────────
 def build_features(texts, fit=False):
-    """
-    Stack three feature sets:
-      1. Word TF-IDF  — unigrams + bigrams  (20K features)
-      2. Char TF-IDF  — 3-5 char n-grams    (30K features)
-      3. Hand-crafted — length, caps ratio, punctuation signals
-    """
     global _word_vec, _char_vec
-
     if fit:
-        _word_vec = TfidfVectorizer(
-            max_features=20000, ngram_range=(1, 2),
-            min_df=2, sublinear_tf=True, analyzer="word",
-        )
-        _char_vec = TfidfVectorizer(
-            max_features=30000, ngram_range=(3, 5),
-            min_df=3, sublinear_tf=True, analyzer="char_wb",
-        )
+        _word_vec = TfidfVectorizer(max_features=8000,  ngram_range=(1, 2),
+                                    min_df=2, sublinear_tf=True, analyzer="word")
+        _char_vec = TfidfVectorizer(max_features=12000, ngram_range=(3, 5),
+                                    min_df=3, sublinear_tf=True, analyzer="char_wb")
         X_word = _word_vec.fit_transform(texts)
         X_char = _char_vec.fit_transform(texts)
     else:
         X_word = _word_vec.transform(texts)
         X_char = _char_vec.transform(texts)
 
-    # Hand-crafted features (length, caps, exclamation, question)
     feats = []
     for t in texts:
-        raw = t if isinstance(t, str) else ""
-        total   = max(len(raw), 1)
+        raw   = t if isinstance(t, str) else ""
+        total = max(len(raw), 1)
         feats.append([
-            min(len(raw) / 500, 1.0),                             # normalised length
-            sum(1 for c in raw if c.isupper()) / total,           # caps ratio
-            min(raw.count("!") / 5, 1.0),                        # exclamation density
-            min(raw.count("?") / 3, 1.0),                        # question density
-            1.0 if has_emoji(raw) else 0.0,                      # emoji present
+            min(len(raw) / 500, 1.0),
+            sum(1 for c in raw if c.isupper()) / total,
+            min(raw.count("!") / 5, 1.0),
+            min(raw.count("?") / 3, 1.0),
+            1.0 if has_emoji(raw) else 0.0,
         ])
     X_hand = csr_matrix(np.array(feats, dtype=np.float32))
-
     return hstack([X_word, X_char, X_hand], format="csr")
 
 # ── TRAINING THREAD ───────────────────────────────────────────────────────────
 def _train():
-    global _train_df, _test_df, _overview, _before_balance, _after_balance
+    global _train_df, _test_df, _overview, _before_balance
     global _wc_data, _kw_data, _len_data, _emoji_data, _len_dist
-    global _model, _model_acc, _report, _cm, _status
+    global _model, _word_vec, _char_vec, _model_acc, _report, _cm, _status
 
     try:
-        # 1. Load ──────────────────────────────────────────────────────────────
+        # 1. Load data ─────────────────────────────────────────────────────────
         _status["step"] = "Loading CSV files…"
-        train_df = pd.read_csv(
-            os.path.join(DATA_DIR, "train_nykaa_review_sentiment.csv"),
-            encoding="utf-8", on_bad_lines="skip")
-        test_df = pd.read_csv(
-            os.path.join(DATA_DIR, "test_nykaa_review_sentiment.csv"),
-            encoding="utf-8", on_bad_lines="skip")
+        train_df = pd.read_csv(os.path.join(DATA_DIR, "train_nykaa_review_sentiment.csv"),
+                               encoding="utf-8", on_bad_lines="skip")
+        test_df  = pd.read_csv(os.path.join(DATA_DIR, "test_nykaa_review_sentiment.csv"),
+                               encoding="utf-8", on_bad_lines="skip")
 
         for df in [train_df, test_df]:
             df.dropna(subset=["content", "sentiment_labels"], inplace=True)
@@ -167,68 +155,87 @@ def _train():
             _wc_data[sent] = [{"text": w, "value": c} for w, c in words]
             _kw_data[sent] = [{"word": w, "count": c} for w, c in words[:20]]
 
-        # 4. Length & emoji stats ──────────────────────────────────────────────
+        # 4. Length + emoji stats ──────────────────────────────────────────────
         train_df["_len"]   = train_df["content"].str.len()
         test_df["_len"]    = test_df["content"].str.len()
         train_df["_emoji"] = train_df["content"].apply(has_emoji)
 
         for sent in LABELS:
             sub = train_df[train_df["sentiment_labels"] == sent]["_len"]
-            _len_data[sent] = {
-                "avg": round(float(sub.mean()), 1),
-                "median": int(sub.median()), "max": int(sub.max()),
-            }
+            _len_data[sent] = {"avg": round(float(sub.mean()), 1),
+                               "median": int(sub.median()), "max": int(sub.max())}
             bc = train_df[train_df["sentiment_labels"] == sent]["_len"] \
                      .apply(length_bucket).value_counts().to_dict()
             _len_dist[sent] = [{"bucket": b, "count": bc.get(b, 0)} for b in BUCKET_ORDER]
-
             sub2 = train_df[train_df["sentiment_labels"] == sent]
             w = int(sub2["_emoji"].sum())
             _emoji_data[sent] = {"with": w, "without": len(sub2) - w}
 
-        # 5. Text cleaning ─────────────────────────────────────────────────────
+        _before_balance = {s: int(train_dist.get(s, 0)) for s in LABELS}
+
+        # 5. Check cache ───────────────────────────────────────────────────────
+        if all(os.path.exists(p) for p in [MODEL_PATH, WORD_VEC_PATH, CHAR_VEC_PATH, META_PATH]):
+            _status["step"] = "Loading cached model…"
+            _word_vec  = joblib.load(WORD_VEC_PATH)
+            _char_vec  = joblib.load(CHAR_VEC_PATH)
+            _model     = joblib.load(MODEL_PATH)
+            meta       = joblib.load(META_PATH)
+            _model_acc = meta["accuracy"]
+            _report    = meta["report"]
+            _cm        = meta["cm"]
+            print(f"✅  Loaded from cache — accuracy {_model_acc}%")
+            _status = {"ready": True, "step": "Ready"}
+            return
+
+        # 6. Clean text ────────────────────────────────────────────────────────
         _status["step"] = "Cleaning text…"
         train_df["_clean"] = train_df["content"].apply(clean_text)
         test_df["_clean"]  = test_df["content"].apply(clean_text)
 
-        y_train = train_df["sentiment_labels"].map(LABEL_MAP).values
+        # 7. Stratified sample — 40K rows (fast + accurate enough) ─────────────
+        _status["step"] = "Sampling training data (40K stratified)…"
+        sample = train_df.groupby("sentiment_labels", group_keys=False).apply(
+            lambda g: g.sample(min(len(g), int(40000 * len(g) / len(train_df))), random_state=42)
+        ).reset_index(drop=True)
+
+        y_train = sample["sentiment_labels"].map(LABEL_MAP).values
         y_test  = test_df["sentiment_labels"].map(LABEL_MAP).values
 
-        _before_balance = {REV_LABEL[k]: int(v) for k, v in Counter(y_train.tolist()).items()}
-        # class_weight handles imbalance — no manual oversampling needed
-        _after_balance  = {k: "balanced (class_weight)" for k in _before_balance}
-
-        # 6. Vectorize — word + char + hand-crafted ────────────────────────────
+        # 8. Vectorize ─────────────────────────────────────────────────────────
         _status["step"] = "Vectorizing text (Word + Char TF-IDF)…"
-        X_train = build_features(train_df["_clean"].tolist(), fit=True)
-        X_test  = build_features(test_df["_clean"].tolist(),  fit=False)
-        print(f"  Feature matrix shape: {X_train.shape}")
+        X_train = build_features(sample["_clean"].tolist(), fit=True)
+        X_test  = build_features(test_df["_clean"].tolist(), fit=False)
+        print(f"  Feature shape: {X_train.shape}")
 
-        # 7. Train — LinearSVC + Platt scaling ────────────────────────────────
-        _status["step"] = "Training LinearSVC (class_weight=balanced)…"
-        base_clf = LinearSVC(C=0.5, max_iter=2000,
-                             class_weight="balanced", random_state=42)
-        clf = CalibratedClassifierCV(base_clf, cv=3, method="sigmoid")
+        # 9. Train ─────────────────────────────────────────────────────────────
+        _status["step"] = "Training LinearSVC…"
+        base = LinearSVC(C=0.5, max_iter=2000, class_weight="balanced", random_state=42)
+        clf  = CalibratedClassifierCV(base, cv=2, method="sigmoid")
         clf.fit(X_train, y_train)
 
-        # 8. Evaluate ──────────────────────────────────────────────────────────
-        _status["step"] = "Evaluating model on test set…"
+        # 10. Evaluate ─────────────────────────────────────────────────────────
+        _status["step"] = "Evaluating on test set…"
         y_pred     = clf.predict(X_test)
         _model_acc = round(float(accuracy_score(y_test, y_pred)) * 100, 2)
-        _report    = classification_report(
-            y_test, y_pred,
-            target_names=["NEGATIVE", "NEUTRAL", "POSITIVE"],
-            output_dict=True,
-        )
+        _report    = classification_report(y_test, y_pred,
+                         target_names=["NEGATIVE", "NEUTRAL", "POSITIVE"],
+                         output_dict=True)
         _cm    = confusion_matrix(y_test, y_pred).tolist()
         _model = clf
 
+        # 11. Save to cache ────────────────────────────────────────────────────
+        _status["step"] = "Saving model to cache…"
+        joblib.dump(_word_vec, WORD_VEC_PATH)
+        joblib.dump(_char_vec, CHAR_VEC_PATH)
+        joblib.dump(_model,    MODEL_PATH)
+        joblib.dump({"accuracy": _model_acc, "report": _report, "cm": _cm}, META_PATH)
+        print(f"✅  Model trained & cached — accuracy {_model_acc}%")
+
         _status = {"ready": True, "step": "Ready"}
-        print(f"✅  Model trained — accuracy {_model_acc}%")
 
     except Exception as exc:
         _status = {"ready": False, "step": f"Error: {exc}"}
-        print(f"❌  Training failed: {exc}")
+        print(f"❌  {exc}")
         raise
 
 
@@ -248,8 +255,8 @@ def api_overview():
 def api_balance():
     return jsonify({
         "before":    _before_balance,
-        "after":     {k: _before_balance.get("POSITIVE", 0) for k in _before_balance},
-        "technique": "class_weight='balanced' in LinearSVC (no oversampling needed)",
+        "after":     {k: max(_before_balance.values()) for k in _before_balance},
+        "technique": "class_weight='balanced' in LinearSVC",
     })
 
 @app.route("/api/wordcloud")
@@ -285,27 +292,20 @@ def api_metrics():
             "f1":        round(r["f1-score"] * 100, 1),
             "support":   int(r["support"]),
         })
-    return jsonify({
-        "accuracy":         _model_acc,
-        "metrics":          metrics,
-        "confusion_matrix": _cm,
-        "labels":           ["NEGATIVE", "NEUTRAL", "POSITIVE"],
-    })
+    return jsonify({"accuracy": _model_acc, "metrics": metrics,
+                    "confusion_matrix": _cm, "labels": ["NEGATIVE", "NEUTRAL", "POSITIVE"]})
 
 @app.route("/api/predict", methods=["POST"])
 def api_predict():
     if not _status["ready"]:
         return jsonify({"error": "Model is still training. Please wait."}), 503
-    data = request.get_json(force=True)
-    text = data.get("text", "").strip()
+    data  = request.get_json(force=True)
+    text  = data.get("text", "").strip()
     if not text:
         return jsonify({"error": "Empty text"}), 400
-
-    cleaned = clean_text(text)
-    X       = build_features([cleaned], fit=False)
-    pred    = int(_model.predict(X)[0])
-    proba   = _model.predict_proba(X)[0]
-
+    X     = build_features([clean_text(text)], fit=False)
+    pred  = int(_model.predict(X)[0])
+    proba = _model.predict_proba(X)[0]
     return jsonify({
         "sentiment":  REV_LABEL[pred],
         "confidence": round(float(max(proba)) * 100, 1),
@@ -328,7 +328,7 @@ def api_reviews():
         df = df[df["sentiment_labels"] == sent]
     total = len(df)
     start = (page - 1) * limit
-    rows  = df.iloc[start: start + limit][["content", "sentiment_labels"]].to_dict("records")
+    rows  = df.iloc[start:start + limit][["content", "sentiment_labels"]].to_dict("records")
     return jsonify({"reviews": rows, "total": total, "page": page,
                     "pages": max(1, (total + limit - 1) // limit)})
 
